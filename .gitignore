@@ -1,0 +1,35 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Checkpoints / model artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
