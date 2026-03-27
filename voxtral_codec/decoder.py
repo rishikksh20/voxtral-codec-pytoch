@@ -1,73 +1,69 @@
-"""
-Voxtral Codec Decoder
+"""Voxtral Codec decoder."""
 
-Architecture (mirror of the encoder):
-  1. Linear projection from latent_dim (292) → hidden_dim
-  2. Four Decoder Blocks (in reverse order of the encoder strides [1, 2, 2, 2]):
-       - Sliding-Window Causal Self-Attention Transformer
-       - Causal upsampling CNN (nearest-neighbour upsample + causal conv)
-  3. De-patchification: ConvTranspose1d with stride=patch_stride → 24 kHz output
+from __future__ import annotations
 
-Overall expansion: 8 (CNN) × 240 (depatch) = 1920×  (12.5 Hz → 24 000 Hz) ✓
-"""
+from typing import Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .encoder import (
-    CausalConv1d,
-    ResidualCausalBlock,
-    SlidingWindowTransformer,
-)
+from .encoder import CausalConv1d, ResidualCausalBlock, SlidingWindowTransformer, _expand_block_param
 
 
 # ---------------------------------------------------------------------------
 # Causal upsampling block
 # ---------------------------------------------------------------------------
 
+class CausalConvTranspose1d(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.trim = max(kernel_size - stride, 0)
+        self.deconv = nn.ConvTranspose1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.deconv(x)
+        if self.trim:
+            x = x[..., :-self.trim]
+        return x
+
+
 class CausalUpsampleBlock(nn.Module):
-    """
-    Causal upsampling via nearest-neighbour interpolation followed by
-    a causal convolution (avoids artefacts of transposed convolutions).
-    """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         stride: int,
+        kernel_size: int,
         n_residual: int = 3,
-        kernel_size: int = 7,
-        dilations: tuple = (1, 3, 9),
+        dilations: Sequence[int] = (1, 3, 9),
     ) -> None:
         super().__init__()
-        assert len(dilations) == n_residual
-
-        self.stride = stride
-
-        if stride > 1:
-            # Nearest-neighbour upsample + causal conv to smooth
-            self.upsample = nn.Sequential(
-                nn.ELU(),
-                nn.Upsample(scale_factor=stride, mode="nearest"),
-                CausalConv1d(in_channels, out_channels, kernel_size=2 * stride),
-            )
-        else:
-            self.upsample = nn.Sequential(
-                nn.ELU(),
-                CausalConv1d(in_channels, out_channels, 1),
-            )
-
-        # Residual dilated conv blocks after upsampling
+        if len(dilations) != n_residual:
+            raise ValueError("len(dilations) must equal n_residual")
+        self.upsample = nn.Sequential(
+            nn.ELU(),
+            CausalConvTranspose1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride),
+        )
         self.residuals = nn.Sequential(
             *[ResidualCausalBlock(out_channels, kernel_size, d) for d in dilations]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.upsample(x)
-        x = self.residuals(x)
-        return x
+        return self.residuals(self.upsample(x))
 
 
 # ---------------------------------------------------------------------------
@@ -85,33 +81,37 @@ class DecoderBlock(nn.Module):
         self,
         channels: int,
         stride: int,
+        kernel_size: int,
         n_residual: int,
-        dilations: tuple,
+        dilations: Sequence[int],
         n_transformer_layers: int,
         n_heads: int,
         ffn_dim: int,
         window_size: int,
+        layer_scale_init: float = 0.01,
+        qk_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        self.cnn = CausalUpsampleBlock(
+            in_channels=channels,
+            out_channels=channels,
+            stride=stride,
+            kernel_size=kernel_size,
+            n_residual=n_residual,
+            dilations=dilations,
+        )
         self.transformer = SlidingWindowTransformer(
             dim=channels,
             n_heads=n_heads,
             ffn_dim=ffn_dim,
             n_layers=n_transformer_layers,
             window_size=window_size,
-        )
-        self.cnn = CausalUpsampleBlock(
-            in_channels=channels,
-            out_channels=channels,
-            stride=stride,
-            n_residual=n_residual,
-            dilations=dilations,
+            layer_scale_init=layer_scale_init,
+            qk_norm_eps=qk_norm_eps,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.transformer(x)
-        x = self.cnn(x)
-        return x
+        return self.transformer(self.cnn(x))
 
 
 # ---------------------------------------------------------------------------
@@ -134,47 +134,60 @@ class VoxtralDecoder(nn.Module):
     def __init__(
         self,
         out_channels: int = 1,
-        hidden_dim: int = 768,
+        hidden_dim: int = 1024,
         latent_dim: int = 292,
         patch_stride: int = 240,
-        block_strides: tuple = (1, 2, 2, 2),
+        patch_kernel_size: int = 7,
+        block_strides: Sequence[int] = (1, 2, 2, 2),
+        block_kernel_sizes: Sequence[int] = (3, 4, 4, 4),
         n_residual: int = 3,
-        dilations: tuple = (1, 3, 9),
-        n_transformer_layers: int = 3,
-        n_heads: int = 12,
-        ffn_dim: int = 3072,
-        window_size: int = 32,
+        dilations: Sequence[int] = (1, 3, 9),
+        n_transformer_layers: int | Sequence[int] = (2, 2, 2, 2),
+        n_heads: int = 16,
+        ffn_dim: int = 4096,
+        window_size: int | Sequence[int] = (2, 4, 8, 16),
+        layer_scale_init: float = 0.01,
+        qk_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
 
-        # --- Projection from latent space --------------------------------
-        self.proj = nn.Conv1d(latent_dim, hidden_dim, 1)
+        block_strides = tuple(block_strides)
+        n_blocks = len(block_strides)
+        block_kernel_sizes = _expand_block_param(block_kernel_sizes, n_blocks, "block_kernel_sizes")
+        window_sizes = _expand_block_param(window_size, n_blocks, "window_size")
+        transformer_layers = _expand_block_param(n_transformer_layers, n_blocks, "n_transformer_layers")
 
-        # --- Four decoder blocks -----------------------------------------
-        self.blocks = nn.ModuleList()
-        for stride in block_strides:
-            self.blocks.append(
+        self.patch_stride = patch_stride
+        self.input_projection = nn.Sequential(
+            CausalConv1d(latent_dim, hidden_dim, kernel_size=1),
+            nn.ELU(),
+        )
+        self.blocks = nn.ModuleList(
+            [
                 DecoderBlock(
                     channels=hidden_dim,
                     stride=stride,
+                    kernel_size=kernel_size,
                     n_residual=n_residual,
                     dilations=dilations,
-                    n_transformer_layers=n_transformer_layers,
+                    n_transformer_layers=layers,
                     n_heads=n_heads,
                     ffn_dim=ffn_dim,
-                    window_size=window_size,
+                    window_size=win,
+                    layer_scale_init=layer_scale_init,
+                    qk_norm_eps=qk_norm_eps,
                 )
-            )
-
-        # --- De-patchification -------------------------------------------
-        # Mirrors the patchify Conv1d: expands (B, hidden_dim, T_latent × 8)
-        # back to (B, out_channels, T) at 24 kHz.
-        self.depatchify = nn.Sequential(
+                for stride, kernel_size, layers, win in zip(
+                    block_strides,
+                    block_kernel_sizes,
+                    transformer_layers,
+                    window_sizes,
+                )
+            ]
+        )
+        self.output_projection = nn.Sequential(
             nn.ELU(),
-            nn.ConvTranspose1d(
-                hidden_dim, out_channels,
-                kernel_size=patch_stride, stride=patch_stride,
-            ),
+            CausalConv1d(hidden_dim, patch_stride, kernel_size=patch_kernel_size),
             nn.Tanh(),
         )
 
@@ -186,8 +199,9 @@ class VoxtralDecoder(nn.Module):
         Returns:
             x_hat: (B, 1, T) reconstructed waveform at 24 kHz
         """
-        x = self.proj(z)              # (B, hidden_dim, T_latent)
+        x = self.input_projection(z)
         for block in self.blocks:
-            x = block(x)              # (B, hidden_dim, T_latent × 8)
-        x_hat = self.depatchify(x)    # (B, 1, T)
-        return x_hat
+            x = block(x)
+        x = self.output_projection(x)
+        batch, patch_dim, frames = x.shape
+        return x.transpose(1, 2).reshape(batch, 1, frames * patch_dim)

@@ -1,23 +1,10 @@
-"""
-VoxtralCodec – Main Autoencoder Model
+from __future__ import annotations
 
-Combines:
-  * VoxtralEncoder   – waveform → 292-dim latent at 12.5 Hz
-  * DualQuantizer    – semantic VQ (256-dim) + acoustic FSQ (36-dim)
-  * VoxtralDecoder   – 292-dim latent → reconstructed waveform
-
-Default configuration targets ~300 M trainable parameters (encoder + decoder).
-The discriminator is a separate module and is not included here.
-
-Bitrate summary:
-  Semantic  : log2(8192) = 13 bits/frame
-  Acoustic  : 36 × log2(21) ≈ 158.1 bits/frame
-  Total     : ≈ 171.1 bits/frame × 12.5 fps ≈ 2.14 kbps  ✓
-"""
+"""Top-level Voxtral Codec model."""
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple
+from typing import Dict, Sequence, Tuple
 
 from .encoder import VoxtralEncoder
 from .decoder import VoxtralDecoder
@@ -52,22 +39,25 @@ class VoxtralCodec(nn.Module):
     def __init__(
         self,
         in_channels: int = 1,
-        hidden_dim: int = 768,
+        hidden_dim: int = 1024,
         latent_dim: int = 292,
         semantic_dim: int = 256,
         acoustic_dim: int = 36,
         patch_stride: int = 240,
-        encoder_strides: Tuple[int, ...] = (2, 2, 2, 1),
-        decoder_strides: Tuple[int, ...] = (1, 2, 2, 2),
+        encoder_strides: Sequence[int] = (2, 2, 2, 1),
+        decoder_strides: Sequence[int] = (1, 2, 2, 2),
+        encoder_kernel_sizes: Sequence[int] = (4, 4, 4, 3),
+        decoder_kernel_sizes: Sequence[int] = (3, 4, 4, 4),
+        patch_kernel_size: int = 7,
         n_residual: int = 3,
-        dilations: Tuple[int, ...] = (1, 3, 9),
-        n_transformer_layers: int = 3,
-        n_heads: int = 12,
-        ffn_dim: int = 3072,
-        window_size: int = 32,
+        dilations: Sequence[int] = (1, 3, 9),
+        n_transformer_layers: int | Sequence[int] = (2, 2, 2, 2),
+        n_heads: int = 16,
+        ffn_dim: int = 4096,
+        window_size: int | Sequence[int] = (16, 8, 4, 2),
         codebook_size: int = 8192,
         fsq_levels: int = 21,
-        commitment_cost: float = 0.25,
+        commitment_cost: float = 0.1,
         sample_rate: int = 24_000,
     ) -> None:
         super().__init__()
@@ -79,15 +69,14 @@ class VoxtralCodec(nn.Module):
 
         self.sample_rate = sample_rate
         self.patch_stride = patch_stride
-        self.encoder_strides = encoder_strides
+        self.encoder_strides = tuple(encoder_strides)
         self.latent_dim = latent_dim
         self.semantic_dim = semantic_dim
         self.acoustic_dim = acoustic_dim
 
         # Effective temporal compression: patch_stride × product(encoder_strides)
-        import math
         _cnn_stride = 1
-        for s in encoder_strides:
+        for s in self.encoder_strides:
             _cnn_stride *= s
         self.total_stride = patch_stride * _cnn_stride
         self.frame_rate = sample_rate / self.total_stride  # 12.5 Hz
@@ -98,7 +87,9 @@ class VoxtralCodec(nn.Module):
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             patch_stride=patch_stride,
+            patch_kernel_size=patch_kernel_size,
             block_strides=encoder_strides,
+            block_kernel_sizes=encoder_kernel_sizes,
             n_residual=n_residual,
             dilations=dilations,
             n_transformer_layers=n_transformer_layers,
@@ -116,18 +107,21 @@ class VoxtralCodec(nn.Module):
             commitment_cost=commitment_cost,
         )
 
+        decoder_windows = tuple(reversed(window_size)) if not isinstance(window_size, int) else window_size
         self.decoder = VoxtralDecoder(
             out_channels=in_channels,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             patch_stride=patch_stride,
+            patch_kernel_size=patch_kernel_size,
             block_strides=decoder_strides,
+            block_kernel_sizes=decoder_kernel_sizes,
             n_residual=n_residual,
             dilations=dilations,
             n_transformer_layers=n_transformer_layers,
             n_heads=n_heads,
             ffn_dim=ffn_dim,
-            window_size=window_size,
+            window_size=decoder_windows,
         )
 
     # ------------------------------------------------------------------
@@ -180,27 +174,11 @@ class VoxtralCodec(nn.Module):
     # Full forward pass
     # ------------------------------------------------------------------
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Full encode-quantize-decode pass.
+    def forward_with_details(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z = self.encoder(x)
+        z_q, sem_idx, ac_codes, vq_loss, acoustic_q = self.quantizer(z)
+        x_hat = self.decoder(z_q)
 
-        Args:
-            x: (B, 1, T) raw waveform
-
-        Returns:
-            x_hat:           (B, 1, T)         reconstructed waveform
-            z:               (B, latent_dim, T_latent) pre-quantization latent
-            semantic_indices:(B, T_latent)     VQ codebook indices
-            acoustic_codes:  (B, acoustic_dim, T_latent) FSQ integer codes
-            vq_loss:         scalar             VQ commitment + codebook loss
-        """
-        z = self.encoder(x)                                          # encode
-        z_q, sem_idx, ac_codes, vq_loss, _ = self.quantizer(z)      # quantize
-        x_hat = self.decoder(z_q)                                    # decode
-
-        # Trim or pad to match input length (strided convolutions may shift length)
         T_in = x.shape[-1]
         T_out = x_hat.shape[-1]
         if T_out > T_in:
@@ -208,7 +186,22 @@ class VoxtralCodec(nn.Module):
         elif T_out < T_in:
             x_hat = torch.nn.functional.pad(x_hat, (0, T_in - T_out))
 
-        return x_hat, z, sem_idx, ac_codes, vq_loss
+        return {
+            "x_hat": x_hat,
+            "z": z,
+            "z_q": z_q,
+            "semantic_indices": sem_idx,
+            "acoustic_codes": ac_codes,
+            "vq_loss": vq_loss,
+            "semantic_q": z_q[:, : self.semantic_dim, :],
+            "acoustic_q": acoustic_q,
+        }
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = self.forward_with_details(x)
+        return out["x_hat"], out["z"], out["semantic_indices"], out["acoustic_codes"], out["vq_loss"]
 
     # ------------------------------------------------------------------
     # Convenience: decode from discrete codes
@@ -229,17 +222,8 @@ class VoxtralCodec(nn.Module):
         Returns:
             x_hat: (B, 1, T)
         """
-        vq = self.quantizer.vq
-        fsq = self.quantizer.fsq
-
-        # Dequantize semantic
-        B, T = semantic_indices.shape
-        z_sem = vq.codebook(semantic_indices.view(-1)).view(B, T, -1)
-        z_sem = z_sem.permute(0, 2, 1)  # (B, 256, T)
-
-        # Dequantize acoustic: codes [0, n_levels-1] → continuous values
-        half = fsq._half_levels.float()
-        z_ac = acoustic_codes.float() - half  # (B, 36, T)
+        z_sem = self.quantizer.vq.lookup(semantic_indices)
+        z_ac = acoustic_codes.float() - self.quantizer.fsq._half_levels.float()
 
         z_q = torch.cat([z_sem, z_ac], dim=1)  # (B, 292, T)
         return self.decoder(z_q)

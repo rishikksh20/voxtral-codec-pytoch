@@ -1,18 +1,9 @@
-"""
-Multi-Resolution STFT Discriminator for Voxtral Codec.
+from __future__ import annotations
 
-Uses 8 different STFT configurations (n_fft sizes). For each configuration:
-  1. Compute STFT of the waveform → complex spectrogram
-  2. Stack real and imaginary parts → 2-channel input
-  3. Pass through a stack of strided Conv2d layers
-  4. Output a score map (logits) and intermediate feature maps
-
-The feature maps are used for the L1 feature-matching adversarial loss.
-"""
+"""Multi-resolution STFT discriminator used by Voxtral Codec."""
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import List, Tuple
 
 
@@ -75,7 +66,7 @@ class STFTDiscriminator(nn.Module):
         n_fft: int,
         hop_length: int | None = None,
         win_length: int | None = None,
-        channels: int = 32,
+        channels: int = 256,
         n_layers: int = 4,
     ) -> None:
         super().__init__()
@@ -87,7 +78,7 @@ class STFTDiscriminator(nn.Module):
         in_ch = 2
         layers = []
         for i in range(n_layers):
-            out_ch = min(channels * (2 ** i), 512)
+            out_ch = min(channels * (2 ** i), 1024)
             layers.append(
                 nn.Sequential(
                     nn.Conv2d(in_ch, out_ch, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4)),
@@ -137,15 +128,10 @@ class STFTDiscriminator(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Eight STFT configurations covering a wide range of time-frequency resolutions
-_DEFAULT_STFT_CONFIGS: List[dict] = [
-    {"n_fft": 2048, "hop_length": 512,  "win_length": 2048},
-    {"n_fft": 1024, "hop_length": 256,  "win_length": 1024},
-    {"n_fft": 512,  "hop_length": 128,  "win_length": 512},
-    {"n_fft": 256,  "hop_length": 64,   "win_length": 256},
-    {"n_fft": 128,  "hop_length": 32,   "win_length": 128},
-    {"n_fft": 4096, "hop_length": 1024, "win_length": 4096},
-    {"n_fft": 8192, "hop_length": 2048, "win_length": 8192},
-    {"n_fft": 300,  "hop_length": 75,   "win_length": 300},
+DEFAULT_STFT_SIZES: tuple[int, ...] = (2296, 1418, 876, 542, 334, 206, 126, 76)
+DEFAULT_STFT_CONFIGS: List[dict] = [
+    {"n_fft": size, "hop_length": max(size // 4, 1), "win_length": size}
+    for size in DEFAULT_STFT_SIZES
 ]
 
 
@@ -159,12 +145,12 @@ class MultiResolutionDiscriminator(nn.Module):
     def __init__(
         self,
         stft_configs: List[dict] | None = None,
-        channels: int = 32,
+        channels: int = 256,
         n_layers: int = 4,
     ) -> None:
         super().__init__()
         if stft_configs is None:
-            stft_configs = _DEFAULT_STFT_CONFIGS
+            stft_configs = DEFAULT_STFT_CONFIGS
 
         assert len(stft_configs) == 8, "Expected exactly 8 STFT configurations"
 

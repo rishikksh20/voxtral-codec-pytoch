@@ -79,8 +79,8 @@ def run_training_step(
     opt_d: optim.Optimizer,
     disc_start_step: int = 0,        # 0 → discriminator active from step 0
     w_feat: float = 1.0,
-    w_adv: float = 0.1,
-    w_vq: float = 1.0,
+    w_adv: float = 0.0,
+    w_vq: float = 0.1,
     rec_initial_weight: float = 1.0,
     rec_decay_steps: float = 10.0,   # fast decay for demo
 ) -> dict:
@@ -117,6 +117,7 @@ def run_training_step(
     import torch.nn.functional as F
     from voxtral_codec.losses import (
         reconstruction_loss,
+        stft_magnitude_loss,
         feature_matching_loss,
         generator_adversarial_loss,
         discriminator_loss,
@@ -127,7 +128,9 @@ def run_training_step(
     disc.eval()       # freeze discriminator batch-norm / dropout during G step
 
     # 1. Encode → Quantize → Decode
-    x_hat, z, _, _, vq_loss = model(x_real)
+    model_out = model.forward_with_details(x_real)
+    x_hat = model_out["x_hat"]
+    vq_loss = model_out["vq_loss"]
 
     # 2. Run discriminator on real + fake (detached disc weights for gradient flow)
     with torch.no_grad():
@@ -144,6 +147,7 @@ def run_training_step(
         initial_weight=rec_initial_weight,
         decay_steps=rec_decay_steps,
     )
+    l_stft = rec_w * stft_magnitude_loss(x_real, x_hat)
     l_feat = w_feat * feature_matching_loss(fmaps_real, fmaps_fake)
     l_vq   = w_vq   * vq_loss
     l_adv  = (
@@ -152,7 +156,7 @@ def run_training_step(
         else torch.zeros(1, device=x_real.device)
     )
 
-    g_loss = l_rec + l_feat + l_vq + l_adv
+    g_loss = l_rec + l_stft + l_feat + l_vq + l_adv
 
     # 4. Update codec
     opt_g.zero_grad()
@@ -183,6 +187,7 @@ def run_training_step(
         "g_total":   g_loss.item(),
         "rec":       l_rec.item(),
         "rec_w":     rec_w,
+        "stft":      l_stft.item(),
         "feat":      l_feat.item(),
         "vq":        l_vq.item(),
         "adv_g":     l_adv.item(),
@@ -229,8 +234,8 @@ def dummy_train(n_steps: int = 5, device_str: str = "cpu") -> None:
     opt_d = optim.AdamW(disc.parameters(),  lr=1e-4, betas=(0.8, 0.99))
 
     # ── Training loop ────────────────────────────────────────────────────────
-    print("Step │ g_total │   rec   │ feat    │   vq    │ adv_g   │  disc")
-    print("─────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────")
+    print("Step │ g_total │   rec   │  stft   │ feat    │   vq    │ adv_g   │  disc")
+    print("─────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────")
 
     for step in range(n_steps):
         # Simulate a batch of raw audio waveforms in [-1, 1]
@@ -246,8 +251,8 @@ def dummy_train(n_steps: int = 5, device_str: str = "cpu") -> None:
             opt_d=opt_d,
             disc_start_step=0,      # enable adversarial loss from step 0 in demo
             w_feat=1.0,
-            w_adv=0.1,
-            w_vq=1.0,
+            w_adv=0.0,
+            w_vq=0.1,
             rec_initial_weight=1.0,
             rec_decay_steps=10.0,   # fast decay so we see it change
         )
@@ -255,7 +260,7 @@ def dummy_train(n_steps: int = 5, device_str: str = "cpu") -> None:
 
         print(
             f"  {step:2d} │ {logs['g_total']:7.4f} │ {logs['rec']:7.4f} │ "
-            f"{logs['feat']:7.4f} │ {logs['vq']:7.4f} │ "
+            f"{logs['stft']:7.4f} │ {logs['feat']:7.4f} │ {logs['vq']:7.4f} │ "
             f"{logs['adv_g']:7.4f} │ {logs['disc']:7.4f}  "
             f"({elapsed:.2f}s)"
         )

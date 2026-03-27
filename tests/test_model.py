@@ -322,12 +322,18 @@ class TestLosses:
         from voxtral_codec.losses import reconstruction_loss
         x = torch.randn(1, 1, 100)
         x_hat = torch.randn(1, 1, 100)
-        _, w0 = reconstruction_loss(x, x_hat, step=0, initial_weight=1.0,
-                                    decay_steps=1000.0)
-        _, w1 = reconstruction_loss(x, x_hat, step=1000, initial_weight=1.0,
-                                    decay_steps=1000.0)
+        _, w0 = reconstruction_loss(x, x_hat, step=0, initial_weight=1.0)
+        _, w1 = reconstruction_loss(x, x_hat, step=1000, initial_weight=1.0)
         assert w0 > w1, "Reconstruction weight should decrease over time"
-        assert abs(w1 - math.exp(-1.0)) < 1e-6
+        assert abs(w1 - (0.9999 ** 1000)) < 1e-6
+
+    def test_stft_magnitude_loss(self):
+        from voxtral_codec.losses import stft_magnitude_loss
+        x = torch.randn(1, 1, 4096)
+        loss_same = stft_magnitude_loss(x, x)
+        loss_diff = stft_magnitude_loss(x, torch.zeros_like(x))
+        assert loss_same.item() == pytest.approx(0.0, abs=1e-6)
+        assert loss_diff.item() >= 0
 
     def test_feature_matching_loss(self):
         from voxtral_codec.losses import feature_matching_loss
@@ -349,10 +355,10 @@ class TestLosses:
 
     def test_generator_adversarial_loss(self):
         from voxtral_codec.losses import generator_adversarial_loss
-        # Perfect fake → logits all 1 → loss ≈ 0
+        # Hinge-style generator loss is -mean(D(fake)).
         logits_fake = [torch.ones(2, 1, 5, 10)]
         loss = generator_adversarial_loss(logits_fake)
-        assert loss.item() == pytest.approx(0.0, abs=1e-4)
+        assert loss.item() == pytest.approx(-1.0, abs=1e-4)
 
 
 # ---------------------------------------------------------------------------

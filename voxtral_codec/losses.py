@@ -1,31 +1,13 @@
-"""
-Loss functions for Voxtral Codec training.
+from __future__ import annotations
 
-Combined training objective:
+"""Training losses for Voxtral Codec."""
 
-    L_total = L_feat_match
-            + λ_rec(t) · L_rec
-            + L_vq
-            + L_asr
-
-where:
-  L_feat_match  – L1 feature-matching loss from the multi-resolution discriminator
-  L_rec         – waveform reconstruction loss (L1), weighted by exponentially
-                  decaying factor λ_rec(t)
-  L_vq          – VQ codebook + commitment loss (from DualQuantizer)
-  L_asr         – ASR distillation loss (from frozen Whisper)
-
-Reference:
-  "Instead of a standard GAN loss, it uses an L1-based feature-matching loss
-   to guide highly discriminative and realistic audio reconstruction."
-"""
-
-import math
 from typing import List, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+
+from .discriminator import DEFAULT_STFT_SIZES
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +19,8 @@ def reconstruction_loss(
     x_hat: torch.Tensor,
     step: int,
     initial_weight: float = 1.0,
-    decay_steps: float = 50_000.0,
+    decay_steps: float | None = None,
+    decay_base: float = 0.9999,
 ) -> Tuple[torch.Tensor, float]:
     """
     L1 waveform reconstruction loss with an exponentially decaying weight.
@@ -58,9 +41,48 @@ def reconstruction_loss(
         loss:   weighted reconstruction loss (scalar tensor)
         weight: current λ(t)  (Python float, for logging)
     """
-    weight = initial_weight * math.exp(-step / decay_steps)
+    if decay_steps is not None:
+        weight = initial_weight * torch.exp(
+            torch.tensor(-step / decay_steps, device=x_real.device, dtype=x_real.dtype)
+        ).item()
+    else:
+        weight = initial_weight * (decay_base ** step)
     loss = F.l1_loss(x_hat, x_real)
     return weight * loss, weight
+
+
+def stft_magnitude_loss(
+    x_real: torch.Tensor,
+    x_hat: torch.Tensor,
+    fft_sizes: Tuple[int, ...] = DEFAULT_STFT_SIZES,
+) -> torch.Tensor:
+    total = x_real.new_zeros(())
+    x_real_1d = x_real.squeeze(1)
+    x_hat_1d = x_hat.squeeze(1)
+    for size in fft_sizes:
+        window = torch.hann_window(size, device=x_real.device)
+        real_spec = torch.stft(
+            x_real_1d,
+            n_fft=size,
+            hop_length=max(size // 4, 1),
+            win_length=size,
+            window=window,
+            return_complex=True,
+            normalized=False,
+            onesided=True,
+        )
+        fake_spec = torch.stft(
+            x_hat_1d,
+            n_fft=size,
+            hop_length=max(size // 4, 1),
+            win_length=size,
+            window=window,
+            return_complex=True,
+            normalized=False,
+            onesided=True,
+        )
+        total = total + F.l1_loss(fake_spec.abs(), real_spec.abs())
+    return total / max(len(fft_sizes), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +137,9 @@ def discriminator_loss(
     Returns:
         loss: scalar tensor
     """
-    loss = torch.tensor(0.0, device=logits_real[0].device)
+    loss = logits_real[0].new_zeros(())
     for lr, lf in zip(logits_real, logits_fake):
-        loss = loss + torch.mean((lr - 1.0) ** 2) + torch.mean(lf ** 2)
+        loss = loss + F.relu(1.0 - lr).mean() + F.relu(1.0 + lf).mean()
     return loss / max(len(logits_real), 1)
 
 
@@ -132,9 +154,9 @@ def generator_adversarial_loss(logits_fake: List[torch.Tensor]) -> torch.Tensor:
     Returns:
         loss: scalar tensor
     """
-    loss = torch.tensor(0.0, device=logits_fake[0].device)
+    loss = logits_fake[0].new_zeros(())
     for lf in logits_fake:
-        loss = loss + torch.mean((lf - 1.0) ** 2)
+        loss = loss - lf.mean()
     return loss / max(len(logits_fake), 1)
 
 
@@ -152,11 +174,12 @@ def codec_loss(
     asr_loss: torch.Tensor,
     step: int,
     w_feat: float = 1.0,
-    w_adv: float = 0.1,
-    w_vq: float = 1.0,
+    w_adv: float = 0.0,
+    w_vq: float = 0.1,
     w_asr: float = 1.0,
     rec_initial_weight: float = 1.0,
-    rec_decay_steps: float = 50_000.0,
+    rec_decay_steps: float | None = None,
+    rec_decay_base: float = 0.9999,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Total generator-side loss for one training step.
@@ -185,17 +208,20 @@ def codec_loss(
         x_real, x_hat, step,
         initial_weight=rec_initial_weight,
         decay_steps=rec_decay_steps,
+        decay_base=rec_decay_base,
     )
+    l_stft = stft_magnitude_loss(x_real, x_hat) * rec_weight
     l_feat = w_feat * feature_matching_loss(fmaps_real, fmaps_fake)
-    l_adv  = w_adv  * generator_adversarial_loss(logits_fake)
+    l_adv  = w_adv * generator_adversarial_loss(logits_fake) if w_adv else x_real.new_zeros(())
     l_vq   = w_vq   * vq_loss
     l_asr  = w_asr  * asr_loss
 
-    total = l_rec + l_feat + l_adv + l_vq + l_asr
+    total = l_rec + l_stft + l_feat + l_adv + l_vq + l_asr
 
     log_dict = {
         "loss/total":          total.item(),
-        "loss/reconstruction": l_rec.item(),
+        "loss/l1":             l_rec.item(),
+        "loss/stft":           l_stft.item(),
         "loss/rec_weight":     rec_weight,
         "loss/feat_match":     l_feat.item(),
         "loss/adv":            l_adv.item(),

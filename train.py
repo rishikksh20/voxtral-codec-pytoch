@@ -143,12 +143,17 @@ def generator_step(
     """
     from voxtral_codec.losses import (
         reconstruction_loss,
+        stft_magnitude_loss,
         feature_matching_loss,
         generator_adversarial_loss,
     )
 
     # ── Encode → Quantize → Decode ──────────────────────────────────────────
-    x_hat, z, _, _, vq_loss = model(x_real)
+    model_out = model.forward_with_details(x_real)
+    x_hat = model_out["x_hat"]
+    z = model_out["z"]
+    z_sem = model_out["semantic_q"]
+    vq_loss = model_out["vq_loss"]
 
     # ── Discriminator feature maps (weights frozen during G step) ───────────
     disc.eval()
@@ -161,15 +166,15 @@ def generator_step(
     logits_fake = [logits for logits, _ in disc_fake_out]
 
     # ── ASR distillation loss (on pre-quantization semantic latent) ─────────
-    z_sem = z[:, : model.semantic_dim, :]          # (B, 256, T_lat)
     l_asr = w_asr * asr_loss_fn(x_real, z_sem)
 
-    # ── Reconstruction loss (L1, exponentially decaying weight) ────────────
+    # ── Reconstruction losses (paper uses the same decay for L1 and STFT) ──
     l_rec, rec_weight = reconstruction_loss(
         x_real, x_hat, step,
         initial_weight=rec_initial_weight,
         decay_steps=rec_decay_steps,
     )
+    l_stft = rec_weight * stft_magnitude_loss(x_real, x_hat)
 
     # ── Feature-matching loss (L1 on discriminator intermediate features) ───
     l_feat = w_feat * feature_matching_loss(fmaps_real, fmaps_fake)
@@ -184,11 +189,12 @@ def generator_step(
     # ── VQ commitment + codebook loss ───────────────────────────────────────
     l_vq = w_vq * vq_loss
 
-    g_loss = l_rec + l_feat + l_adv + l_vq + l_asr
+    g_loss = l_rec + l_stft + l_feat + l_adv + l_vq + l_asr
 
     log_dict = {
         "loss/total":          g_loss.item(),
-        "loss/reconstruction": l_rec.item(),
+        "loss/l1":            l_rec.item(),
+        "loss/stft":          l_stft.item(),
         "loss/rec_weight":     rec_weight,
         "loss/feat_match":     l_feat.item(),
         "loss/adv_g":          l_adv.item(),
@@ -295,9 +301,9 @@ def get_args() -> argparse.Namespace:
     # Loss weights
     p.add_argument("--w_feat", type=float, default=1.0,
                    help="Weight for feature-matching loss")
-    p.add_argument("--w_adv",  type=float, default=0.1,
-                   help="Weight for generator adversarial loss")
-    p.add_argument("--w_vq",   type=float, default=1.0,
+    p.add_argument("--w_adv",  type=float, default=0.0,
+                   help="Optional weight for generator adversarial loss (paper uses feature matching instead)")
+    p.add_argument("--w_vq",   type=float, default=0.1,
                    help="Weight for VQ commitment loss")
     p.add_argument("--w_asr",  type=float, default=1.0,
                    help="Weight for ASR distillation loss")
@@ -312,8 +318,8 @@ def get_args() -> argparse.Namespace:
                    help="Enable Whisper ASR distillation loss")
     p.add_argument("--whisper_model", type=str, default="openai/whisper-base")
     # Model arch
-    p.add_argument("--hidden_dim", type=int, default=768)
-    p.add_argument("--n_transformer_layers", type=int, default=3,
+    p.add_argument("--hidden_dim", type=int, default=1024)
+    p.add_argument("--n_transformer_layers", type=int, default=2,
                    help="Number of transformer layers per encoder/decoder block")
     # Misc
     p.add_argument("--log_every",  type=int, default=100)

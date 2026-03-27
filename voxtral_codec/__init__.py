@@ -9,6 +9,7 @@ from .quantizer import DualQuantizer, VectorQuantizer, FSQ
 from .discriminator import MultiResolutionDiscriminator, STFTDiscriminator
 from .losses import (
     reconstruction_loss,
+    stft_magnitude_loss,
     feature_matching_loss,
     discriminator_loss,
     generator_adversarial_loss,
@@ -26,6 +27,7 @@ __all__ = [
     "MultiResolutionDiscriminator",
     "STFTDiscriminator",
     "reconstruction_loss",
+    "stft_magnitude_loss",
     "feature_matching_loss",
     "discriminator_loss",
     "generator_adversarial_loss",
