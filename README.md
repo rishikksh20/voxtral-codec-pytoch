@@ -1,4 +1,4 @@
-# Voxtral Codec PyTorch
+# Voxtral Codec PyTorch (Partially Vibe coded)
 
 This repository contains a PyTorch implementation of the Voxtral Codec component used to convert 24 kHz mono speech waveforms into discrete codes for TTS training.
 
