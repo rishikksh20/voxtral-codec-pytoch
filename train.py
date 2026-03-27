@@ -1,30 +1,45 @@
 """
 Voxtral Codec – End-to-End Training Script
 
-Training objective:
-  L_total = λ_rec(t) · L_rec          (exponentially decaying reconstruction)
-           + L_feat_match              (L1 feature-matching from discriminator)
-           + L_adv                     (generator adversarial, LS-GAN)
-           + L_vq                      (VQ codebook + commitment)
-           + L_asr                     (Whisper ASR distillation)
+Training philosophy:
+  The codec (encoder + quantizer + decoder) is the "generator" G.
+  The multi-resolution STFT discriminator is D.
 
-The discriminator is updated with an alternating optimiser schedule
-(one discriminator step per generator step).
+  Each training step has two phases:
+
+  ┌─ GENERATOR STEP ──────────────────────────────────────────────────┐
+  │  x_real → Encoder → z (292-dim pre-quant latent)                  │
+  │                         ├─ z_sem (256-dim) → VQ  → z_sem_q        │
+  │                         └─ z_ac  ( 36-dim) → FSQ → z_ac_q         │
+  │                                              z_q = [z_sem_q|z_ac_q]│
+  │  z_q → Decoder → x_hat                                            │
+  │                                                                    │
+  │  x_real, x_hat → D (frozen) → fmaps_real, fmaps_fake             │
+  │                                                                    │
+  │  L_total = λ(t)·L1(x_hat, x_real)   ← decaying reconstruction    │
+  │          + L1(fmaps_fake, fmaps_real) ← feature-matching          │
+  │          + VQ commitment loss                                      │
+  │          + MSE(proj(z_sem), Whisper(x_real)) ← ASR distillation   │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌─ DISCRIMINATOR STEP ──────────────────────────────────────────────┐
+  │  x_real, x_hat.detach() → D (trainable)                           │
+  │  L_D = LS-GAN(real→1, fake→0)                                     │
+  └────────────────────────────────────────────────────────────────────┘
 
 Usage example:
-  python train.py \
-      --data_dir /path/to/wav24k \
-      --batch_size 8 \
-      --max_steps 400000 \
+  python train.py \\
+      --data_dir /path/to/wav24k \\
+      --batch_size 8 \\
+      --max_steps 400000 \\
       --save_dir ./checkpoints
 """
 
 import argparse
 import os
 import random
-import math
 import time
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,8 +53,8 @@ from torch.utils.data import Dataset, DataLoader
 
 class AudioDataset(Dataset):
     """
-    Loads .wav files from a directory, crops/pads to a fixed length, and
-    returns mono 24 kHz waveforms as (1, T) tensors in [-1, 1].
+    Loads .wav/.flac files from a directory tree, crops/pads to a fixed length,
+    and returns mono 24 kHz waveforms as (1, T) tensors in [-1, 1].
     """
 
     def __init__(
@@ -75,15 +90,12 @@ class AudioDataset(Dataset):
         path = self.files[idx]
         waveform, sr = self._torchaudio.load(path)
 
-        # Resample if needed
         if sr != self.sample_rate:
             waveform = TAF.resample(waveform, sr, self.sample_rate)
 
-        # To mono
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Crop or pad to fixed length
         T = waveform.shape[-1]
         if T >= self.segment:
             start = random.randint(0, T - self.segment)
@@ -91,7 +103,6 @@ class AudioDataset(Dataset):
         else:
             waveform = nn.functional.pad(waveform, (0, self.segment - T))
 
-        # Normalise to [-1, 1]
         peak = waveform.abs().max()
         if peak > 0:
             waveform = waveform / peak
@@ -100,42 +111,124 @@ class AudioDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Core training step  (generator + discriminator, in that order)
 # ---------------------------------------------------------------------------
 
-def get_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Voxtral Codec")
-    p.add_argument("--data_dir", type=str, required=True,
-                   help="Directory containing .wav/.flac files (searched recursively)")
-    p.add_argument("--save_dir", type=str, default="./checkpoints")
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--segment_sec", type=float, default=4.0,
-                   help="Audio segment length in seconds")
-    p.add_argument("--sample_rate", type=int, default=24_000)
-    p.add_argument("--max_steps", type=int, default=400_000)
-    p.add_argument("--lr_g", type=float, default=3e-4, help="Generator learning rate")
-    p.add_argument("--lr_d", type=float, default=1e-4, help="Discriminator learning rate")
-    p.add_argument("--disc_start_step", type=int, default=50_000,
-                   help="Delay discriminator training by this many steps")
-    p.add_argument("--w_feat", type=float, default=1.0)
-    p.add_argument("--w_adv",  type=float, default=0.1)
-    p.add_argument("--w_vq",   type=float, default=1.0)
-    p.add_argument("--w_asr",  type=float, default=1.0)
-    p.add_argument("--rec_initial_weight", type=float, default=1.0,
-                   help="Initial weight λ₀ for reconstruction loss")
-    p.add_argument("--rec_decay_steps", type=float, default=50_000.0,
-                   help="Decay constant τ for reconstruction loss (steps)")
-    p.add_argument("--use_asr", action="store_true",
-                   help="Enable Whisper ASR distillation loss")
-    p.add_argument("--whisper_model", type=str, default="openai/whisper-base")
-    p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--save_every", type=int, default=10_000)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--hidden_dim", type=int, default=768)
-    p.add_argument("--n_transformer_layers", type=int, default=4)
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+def generator_step(
+    x_real: torch.Tensor,
+    model: nn.Module,
+    disc: nn.Module,
+    asr_loss_fn: nn.Module,
+    step: int,
+    w_feat: float,
+    w_adv: float,
+    w_vq: float,
+    w_asr: float,
+    rec_initial_weight: float,
+    rec_decay_steps: float,
+    disc_start_step: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """
+    Full generator-side training step.
 
+    Pipeline:
+      x_real → Encoder → z → DualQuantizer → z_q → Decoder → x_hat
+      x_real, x_hat → Discriminator (frozen) → feature maps
+      Compute: L_rec + L_feat + L_adv + L_vq + L_asr
+
+    Returns:
+        g_loss:  total generator loss (scalar)
+        x_hat:   reconstructed waveform (for reuse in discriminator step)
+        log_dict: per-component loss values for logging
+    """
+    from voxtral_codec.losses import (
+        reconstruction_loss,
+        feature_matching_loss,
+        generator_adversarial_loss,
+    )
+
+    # ── Encode → Quantize → Decode ──────────────────────────────────────────
+    x_hat, z, _, _, vq_loss = model(x_real)
+
+    # ── Discriminator feature maps (weights frozen during G step) ───────────
+    disc.eval()
+    with torch.no_grad():
+        disc_real_out = disc(x_real)
+    disc_fake_out = disc(x_hat)
+
+    fmaps_real  = [fmaps  for _, fmaps  in disc_real_out]
+    fmaps_fake  = [fmaps  for _, fmaps  in disc_fake_out]
+    logits_fake = [logits for logits, _ in disc_fake_out]
+
+    # ── ASR distillation loss (on pre-quantization semantic latent) ─────────
+    z_sem = z[:, : model.semantic_dim, :]          # (B, 256, T_lat)
+    l_asr = w_asr * asr_loss_fn(x_real, z_sem)
+
+    # ── Reconstruction loss (L1, exponentially decaying weight) ────────────
+    l_rec, rec_weight = reconstruction_loss(
+        x_real, x_hat, step,
+        initial_weight=rec_initial_weight,
+        decay_steps=rec_decay_steps,
+    )
+
+    # ── Feature-matching loss (L1 on discriminator intermediate features) ───
+    l_feat = w_feat * feature_matching_loss(fmaps_real, fmaps_fake)
+
+    # ── Generator adversarial loss (active only after disc warm-up) ─────────
+    l_adv = (
+        w_adv * generator_adversarial_loss(logits_fake)
+        if step >= disc_start_step
+        else torch.zeros(1, device=x_real.device)
+    )
+
+    # ── VQ commitment + codebook loss ───────────────────────────────────────
+    l_vq = w_vq * vq_loss
+
+    g_loss = l_rec + l_feat + l_adv + l_vq + l_asr
+
+    log_dict = {
+        "loss/total":          g_loss.item(),
+        "loss/reconstruction": l_rec.item(),
+        "loss/rec_weight":     rec_weight,
+        "loss/feat_match":     l_feat.item(),
+        "loss/adv_g":          l_adv.item(),
+        "loss/vq":             l_vq.item(),
+        "loss/asr":            l_asr.item(),
+    }
+    return g_loss, x_hat, log_dict
+
+
+def discriminator_step(
+    x_real: torch.Tensor,
+    x_hat: torch.Tensor,
+    disc: nn.Module,
+) -> Tuple[torch.Tensor, float]:
+    """
+    Discriminator training step.
+
+    Reuses the already-generated x_hat from the generator step (detached).
+    Uses LS-GAN: L_D = E[(D(real)-1)²] + E[D(fake)²]
+
+    Returns:
+        d_loss: discriminator loss (scalar)
+        d_loss_val: Python float for logging
+    """
+    from voxtral_codec.losses import discriminator_loss
+
+    disc.train()
+    disc_real_out = disc(x_real)
+    disc_fake_out = disc(x_hat.detach())      # detach: stop grads into G
+
+    logits_real = [logits for logits, _ in disc_real_out]
+    logits_fake = [logits for logits, _ in disc_fake_out]
+
+    d_loss = discriminator_loss(logits_real, logits_fake)
+    return d_loss, d_loss.item()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
 
 def save_checkpoint(
     step: int,
@@ -149,9 +242,9 @@ def save_checkpoint(
     path = os.path.join(save_dir, f"checkpoint_step{step:07d}.pt")
     torch.save(
         {
-            "step": step,
+            "step":             step,
             "model_state_dict": model.state_dict(),
-            "disc_state_dict": disc.state_dict(),
+            "disc_state_dict":  disc.state_dict(),
             "opt_g_state_dict": opt_g.state_dict(),
             "opt_d_state_dict": opt_d.state_dict(),
         },
@@ -159,6 +252,80 @@ def save_checkpoint(
     )
     print(f"  Saved checkpoint → {path}")
 
+
+def load_checkpoint(
+    path: str,
+    model: nn.Module,
+    disc: nn.Module,
+    opt_g: optim.Optimizer,
+    opt_d: optim.Optimizer,
+    device: torch.device,
+) -> int:
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    disc.load_state_dict(ckpt["disc_state_dict"])
+    opt_g.load_state_dict(ckpt["opt_g_state_dict"])
+    opt_d.load_state_dict(ckpt["opt_d_state_dict"])
+    step = ckpt["step"]
+    print(f"  Resumed from {path}  (step {step})")
+    return step
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def get_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train Voxtral Codec")
+    p.add_argument("--data_dir", type=str, required=True,
+                   help="Directory containing .wav/.flac files (searched recursively)")
+    p.add_argument("--save_dir",   type=str, default="./checkpoints")
+    p.add_argument("--resume",     type=str, default=None,
+                   help="Path to checkpoint to resume from")
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--segment_sec", type=float, default=4.0,
+                   help="Audio segment length in seconds")
+    p.add_argument("--sample_rate", type=int, default=24_000)
+    p.add_argument("--max_steps",  type=int, default=400_000)
+    # Optimiser
+    p.add_argument("--lr_g", type=float, default=3e-4,
+                   help="Generator (codec) learning rate")
+    p.add_argument("--lr_d", type=float, default=1e-4,
+                   help="Discriminator learning rate")
+    # Loss weights
+    p.add_argument("--w_feat", type=float, default=1.0,
+                   help="Weight for feature-matching loss")
+    p.add_argument("--w_adv",  type=float, default=0.1,
+                   help="Weight for generator adversarial loss")
+    p.add_argument("--w_vq",   type=float, default=1.0,
+                   help="Weight for VQ commitment loss")
+    p.add_argument("--w_asr",  type=float, default=1.0,
+                   help="Weight for ASR distillation loss")
+    p.add_argument("--rec_initial_weight", type=float, default=1.0,
+                   help="Initial weight λ₀ for exponentially decaying reconstruction loss")
+    p.add_argument("--rec_decay_steps", type=float, default=50_000.0,
+                   help="Decay constant τ (steps) for reconstruction loss")
+    p.add_argument("--disc_start_step", type=int, default=50_000,
+                   help="Delay discriminator + adversarial losses by this many steps")
+    # ASR distillation
+    p.add_argument("--use_asr", action="store_true",
+                   help="Enable Whisper ASR distillation loss")
+    p.add_argument("--whisper_model", type=str, default="openai/whisper-base")
+    # Model arch
+    p.add_argument("--hidden_dim", type=int, default=768)
+    p.add_argument("--n_transformer_layers", type=int, default=3,
+                   help="Number of transformer layers per encoder/decoder block")
+    # Misc
+    p.add_argument("--log_every",  type=int, default=100)
+    p.add_argument("--save_every", type=int, default=10_000)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = get_args()
@@ -192,9 +359,6 @@ def main() -> None:
     # Models
     # ------------------------------------------------------------------
     from voxtral_codec import VoxtralCodec, MultiResolutionDiscriminator
-    from voxtral_codec.losses import (
-        codec_loss, discriminator_loss, feature_matching_loss,
-    )
     from voxtral_codec.asr_distillation import ASRDistillationLoss, NoOpASRLoss
 
     model = VoxtralCodec(
@@ -210,6 +374,7 @@ def main() -> None:
         f"{sum(p.numel() for p in disc.parameters()) / 1e6:.1f}M params"
     )
 
+    asr_loss_fn: nn.Module
     if args.use_asr:
         asr_loss_fn = ASRDistillationLoss(
             whisper_model_name=args.whisper_model,
@@ -221,6 +386,8 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # Optimisers
+    #   G optimiser covers codec + (optional) ASR projection head.
+    #   D optimiser covers only the discriminator.
     # ------------------------------------------------------------------
     opt_g = optim.AdamW(
         list(model.parameters()) + list(asr_loss_fn.parameters()),
@@ -232,10 +399,16 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Training loop
+    # Optionally resume from checkpoint
     # ------------------------------------------------------------------
     step = 0
-    running_log: dict = {}
+    if args.resume:
+        step = load_checkpoint(args.resume, model, disc, opt_g, opt_d, device)
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+    running_log: Dict[str, float] = {}
     t0 = time.time()
 
     while step < args.max_steps:
@@ -245,76 +418,38 @@ def main() -> None:
 
             x_real = batch.to(device)  # (B, 1, T)
 
-            # --------------------------------------------------------------
-            # 1. Generator / codec step
-            # --------------------------------------------------------------
+            # ── Generator step ─────────────────────────────────────────────
             model.train()
-            disc.eval()  # disc in eval during generator update
-
-            x_hat, z, sem_idx, ac_codes, vq_loss = model(x_real)
-
-            # Discriminator feature maps
-            with torch.no_grad():
-                disc_real_out = disc(x_real)
-            disc_fake_out = disc(x_hat)
-
-            fmaps_real = [fmaps for _, fmaps in disc_real_out]
-            fmaps_fake = [fmaps for _, fmaps in disc_fake_out]
-            logits_fake = [logits for logits, _ in disc_fake_out]
-
-            # ASR distillation (uses pre-quantization semantic latent)
-            z_semantic = z[:, : model.semantic_dim, :]
-            asr_loss = asr_loss_fn(x_real, z_semantic)
-
-            g_loss, log_dict = codec_loss(
+            g_loss, x_hat, log_dict = generator_step(
                 x_real=x_real,
-                x_hat=x_hat,
-                fmaps_real=fmaps_real,
-                fmaps_fake=fmaps_fake,
-                logits_fake=logits_fake,
-                vq_loss=vq_loss,
-                asr_loss=asr_loss,
+                model=model,
+                disc=disc,
+                asr_loss_fn=asr_loss_fn,
                 step=step,
                 w_feat=args.w_feat,
-                w_adv=args.w_adv if step >= args.disc_start_step else 0.0,
+                w_adv=args.w_adv,
                 w_vq=args.w_vq,
                 w_asr=args.w_asr,
                 rec_initial_weight=args.rec_initial_weight,
                 rec_decay_steps=args.rec_decay_steps,
+                disc_start_step=args.disc_start_step,
             )
-
             opt_g.zero_grad()
             g_loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt_g.step()
 
-            # --------------------------------------------------------------
-            # 2. Discriminator step  (after warm-up)
-            # --------------------------------------------------------------
+            # ── Discriminator step (after warm-up) ─────────────────────────
             if step >= args.disc_start_step:
-                disc.train()
-
-                with torch.no_grad():
-                    x_hat_d = model(x_real)[0]  # detached generated audio
-
-                disc_real_out_d = disc(x_real)
-                disc_fake_out_d = disc(x_hat_d.detach())
-
-                logits_real_d = [l for l, _ in disc_real_out_d]
-                logits_fake_d = [l for l, _ in disc_fake_out_d]
-
-                d_loss = discriminator_loss(logits_real_d, logits_fake_d)
-
+                # Reuse x_hat from generator step (detached) — no extra fwd pass
+                d_loss, d_loss_val = discriminator_step(x_real, x_hat, disc)
                 opt_d.zero_grad()
                 d_loss.backward()
                 nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
                 opt_d.step()
+                log_dict["loss/disc"] = d_loss_val
 
-                log_dict["loss/discriminator"] = d_loss.item()
-
-            # --------------------------------------------------------------
-            # Logging
-            # --------------------------------------------------------------
+            # ── Logging ────────────────────────────────────────────────────
             for k, v in log_dict.items():
                 running_log[k] = running_log.get(k, 0.0) + v
 
@@ -336,7 +471,6 @@ def main() -> None:
             if step % args.save_every == 0:
                 save_checkpoint(step, model, disc, opt_g, opt_d, args.save_dir)
 
-    # Final checkpoint
     save_checkpoint(step, model, disc, opt_g, opt_d, args.save_dir)
     print("Training complete.")
 
